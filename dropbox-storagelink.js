@@ -25,6 +25,9 @@ var _ = ( function( ){
 	return defaultModules;
 } )( );
 
+//Local constants
+const LINK_TYPE = "link command";
+
 /*
 	Get the type of platform this node is running.
 */
@@ -39,6 +42,40 @@ var linkCommands = {
 	loadDb: loadDb,
 	link: link				
 };
+//Provide a type setting so that this will be a reference as a link command
+for( var command in linkCommands ){
+	linkCommands[ command ].type = LINK_TYPE;
+}
+
+function listProcedures( procedure ){
+	try{
+		//Mask the link commands as delegates
+		if( !linkCommands.delegates ){
+			linkCommands.delegates = {};
+			for( var command in linkCommands ){
+				if( linkCommands[ command ].type == LINK_TYPE ){
+					linkCommands.delegates[ command ] = function( ){
+						( linkCommands.procedures || linkCommands.procedures = [ ] )
+							.push( procedure );	
+						linkCommands[ command ].apply( linkCommands, arguments );
+					}
+				}
+			}
+		}
+		
+		var chainFunction =  function( config ){
+			
+		};
+
+		for( var command in linkCommands.delegates ){
+			chainFunction[ command ] = linkCommands.delegates[ command ];
+		}
+
+		return chainFunction;
+	}catch( error ){
+
+	}
+}
 
 /*
 	This running app is called a LINKER.
@@ -69,18 +106,20 @@ function loadDb( host, port, callback ){
 	try{
 		var constructMongoDbCommand = function( path, host, port ){
 			return ( function( config ){
+				
+				path = config.path || path;
+				host = config.host || host;
+				port = config.port || port;
+
 				config = config || {
-					logPath: "./log",
 					logAppend: true,
-					pidFilePath: "./pid",
 					fork: true,
 					directoryPerDb: true,
 					journaling: true
 				};
 
-				path = config.path || path;
-				host = config.host || host;
-				port = config.port || port;
+				config.logPath = config.logPath || ( path + "/log" );
+				config.pidFilePath = config.pidFilePath || ( path + "/pid" );
 
 				var command = "mongod ";
 				
@@ -182,7 +221,7 @@ function loadDb( host, port, callback ){
 						callback( parseInt( stdout ) == pid );
 					} );
 			}
-		}
+		};
 
 		var getAllRunningBackUpDbServers = function( path, callback ){
 			/*
@@ -307,10 +346,18 @@ function loadDb( host, port, callback ){
 			} );
 		};
 
+		var onErrorCallback = function( error, callback ){
+			if( !callback.called ){
+				callback.called = true;
+				callback( error );
+			}
+		};
+
 		var createBackUpDbServer = function( host, port, callback ){
 			return ( function( config ){
 				config = config || {};
 
+				//The path here is the root path.
 				config.path = config.path || "./linkdb";
 
 				var dbServerName = config.dbServerName || config.id;
@@ -325,10 +372,7 @@ function loadDb( host, port, callback ){
 					dbServerProcess = _.process.exec( mongoDbCommand,
 						function( error, stdout, stderr ){
 							if( error ){
-								if( !callback.called ){
-									callback.called = true;
-									return callback( error );
-								}
+								return onErrorCallback( error, callback );
 							}
 						} );
 				}
@@ -336,8 +380,16 @@ function loadDb( host, port, callback ){
 				_.fs.exists( dbServerFolder + "/pid",
 					function( result ){
 						if( result ){
-							_.fs.
+							_.fs.unlink( dbServerFolder + "/pid",
+								function( error ){
+									if( error ){
+										return onErrorCallback( error, callback );
+									}
+									startBackUpDbServer( );
+								} );
+							return;
 						}
+						startBackUpDbServer( );
 					} );
 
 				dbServerProcess.stdout.on( "data",
@@ -351,7 +403,7 @@ function loadDb( host, port, callback ){
 							_.fs.readFile( dbServerFolder + "/pid",
 								function( error, pid ){
 									if( error ){
-										return callback( error );
+										return onErrorCallback( error, callback );
 									}
 
 									pid = parseInt( pid.replace( /\s+/g, "" ) );
@@ -362,29 +414,32 @@ function loadDb( host, port, callback ){
 										This procedure is static. Attempt to edit makes the 
 											database server inaccessible.
 									*/
+									var hash = _.crypto.createHash( "md5" )
+										.update( JSON.stringify( {
+												pid: pid,
+												id: config.id,
+												name: dbServerName,
+												port: port,
+												host: host
+											} ), "utf8" )
+										.digest( "hex" ).toString( );
+
 									_.fs.appendFile( dbServerFolder + "/pid",
 										( config.id + "\n" +
 											dbServerName + "\n" +
 											host + "\n" +
 											port + "\n" +
-											_.crypto.createHash( "md5" )
-												.update( JSON.stringify( {
-														pid: pid,
-														id: config.id,
-														name: dbServerName,
-														port: port,
-														host: host
-													} ), "utf8" )
-												.digest( "hex" ).toString( ) ),
+											hash ),
 										function( error ){
 											if( error ){
-												if( !callback.called ){
-													callback.called = true;
-													return callback( error );	
-												}
+												return onErrorCallback( error, callback );
 											}
 
-
+											callback( {
+												hash: hash,
+												process: dbServerProcess,
+												folder: dbServerFolder
+											} );
 										} );		
 								} );
 						}
@@ -402,7 +457,9 @@ function loadDb( host, port, callback ){
 
 				dbServerProcess.on( "exit",
 					function( code ){
-
+						if( config.onDbServerCloseHandler ){
+							config.onDbServerCloseHandler( ( host + ":" + port ), code );
+						}
 					} );
 			} );
 		};
@@ -415,6 +472,14 @@ function loadDb( host, port, callback ){
 			port = config.port || port;
 			callback = config.callback || callback;
 
+			if( !host || !port || !callback ){
+				var error = new Error( "invalid parameter values" );
+				if( callback ){
+					return callback( error );
+				}
+				throw error;
+			}
+
 			_.dbList = _.dbList || {};
 
 			var dbServerInfo = config.dbServerInfo || _.dbList[ host + ":" + port ];
@@ -423,9 +488,11 @@ function loadDb( host, port, callback ){
 				_.dbList[ dbServerInfo.host + ":" + dbServerInfo.port ] = dbServerInfo;
 			}
 
-			dbServerInfo.id = dbServerInfo.id || _.crypto.createHash( "md5" )
+			dbServerInfo.id = config.id || dbServerInfo.id || _.crypto.createHash( "md5" )
 				.update( _.uuid.v4( ), "utf8" )
 				.digest( "hex" ).toString( );
+
+			dbServerInfo.name = config.name || dbServerInfo.name || dbServerInfo.id;
 
 			//Check if the db is in the list
 			if( dbServerInfo ){
@@ -442,17 +509,31 @@ function loadDb( host, port, callback ){
 							linkCommands.selectedDb = dbServerInfo;
 							callback( dbServerInfo );
 						}else{
+							//The database is not alive so creating it.
+							createBackUpDbServer( host, port,
+								function( result ){
+									if( result instanceof Error ){
+										return callback( result );
+									}
 
+									dbServerInfo.hash = result.hash;
+									dbServerInfo.proces = result.process;
+									dbServerInfo.folder = result.folder;
+
+									dbServerInfo.lastCheckAliveDate = Date.now( );
+									linkCommands.selectedDb = dbServerInfo;
+									callback( dbServerInfo );
+								} )( config );
 						}
-
 					} );
 			}else{
 				//Proceed checking if a back up db server exists.
-				//This will randomnly select 
+				//This will randomnly select a database server.
+
 			}
 
 			return linkCommands;
-		} );
+		} ), ( config. );
 	}catch( error ){
 
 	}
@@ -488,6 +569,8 @@ function link( appID ){
 			return linkCommands;
 		} );
 	}catch( error ){
+
+	}finally{
 
 	}
 };
