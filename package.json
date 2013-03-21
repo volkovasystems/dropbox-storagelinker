@@ -1,0 +1,11 @@
+{
+	"name": "dropbox-storagelink",
+	"version": "0.0.1",
+	"dependencies": {
+		"async": "",
+		"dbox": "",
+		"node-uuid":"",
+		"mongodb":"",
+		"forever-monitor":""
+	}
+}
