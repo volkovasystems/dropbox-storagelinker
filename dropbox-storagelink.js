@@ -34,42 +34,177 @@ const LINK_TYPE = "link command";
 _.platformType = process.platform;
 
 //Reference link commands.
-var linkCommands = {
-	authorize: authorize,
-	add: add,
-	remove: remove,
-	check: check,
-	loadDb: loadDb,
-	link: link				
-};
-//Provide a type setting so that this will be a reference as a link command
-for( var command in linkCommands ){
-	linkCommands[ command ].type = LINK_TYPE;
-}
+function constructLinkCommands( linkCommands ){
+	if( !linkCommands.hasLinkedCommands ){
+		linkCommands = linkCommands || {
+			authorize: authorize,
+			add: add,
+			remove: remove,
+			check: check,
+			loadDb: loadDb,
+			link: link				
+		};
 
-function listProcedures( procedure ){
+		for( var command in linkCommands ){
+			linkCommands[ command ].type = linkCommands[ command ].type || LINK_TYPE;
+		}
+
+		//Circularized intelligently.
+		//This prevents memory leaks.
+		linkCommands.getLinkedCommands = linkCommands.getLinkedCommands || function( ){
+			return linkCommands;
+		}
+
+		linkCommands.hasLinkedCommands = true;
+	}
+	
+	return linkCommands;
+};
+
+
+
+function listProcedures( linkCommands, procedure ){
 	try{
+		var chainFunction;
+
 		//Mask the link commands as delegates
-		if( !linkCommands.delegates ){
-			linkCommands.delegates = {};
-			for( var command in linkCommands ){
-				if( linkCommands[ command ].type == LINK_TYPE ){
-					linkCommands.delegates[ command ] = function( ){
+		//We have to retain the previous.
+		linkCommands.delegates = linkCommands.delegates || {};
+
+		//This will either assign or overrides.
+		for( var command in linkCommands ){
+			if( linkCommands[ command ].type == LINK_TYPE ){
+				//First, prepare the originals we don't want them to be overriden.
+				var delegates = {};
+				for( var _command in linkCommands.delegates ){
+					if( command != _command ){
+						delegates[ _command ] = linkCommands.delegates[ _command ];
+					}
+				}
+				linkCommands.delegates[ command ] = function( ){
+					clearTimeout( chainFunction.run );
+					//When this function is called, restore the other functions to originals.
+					for( var _command in delegates ){
+						linkCommands.delegates[ _command ] = delegates[ _command ];
+					}
+					//Mark the procedure with an ID so that it will not be pushed again.
+					if( !procedure.id ){
+						procedure.id = _.crypto.createHash( "md5" )
+							.update( _.uuid.v4( ), "utf8" )
+							.digest( "hex" ).toString( );
 						( linkCommands.procedures || linkCommands.procedures = [ ] )
 							.push( procedure );	
-						linkCommands[ command ].apply( linkCommands, arguments );
 					}
+					//Now a link can be linked once ( by linking we are also calling it )
+					//When a link is linked, it should restore the state of other links.
+					linkCommands[ command ].apply( linkCommands, arguments );
 				}
 			}
 		}
 		
-		var chainFunction =  function( config ){
+		//I am thinking of timed calls.
+		chainFunction =  function( config ){
+			//Push the configuration.
+			( linkCommands.configs || linkCommands.configs = [ ] ).push( config );
 			
+			//If a next function is not called within 100 milliseconds ( please lower if possible )
+			//Execute this run function. 
+			setTimeout( chainFunction.run, 100 );
 		};
 
+		//Merge the delegates to the chain function.
 		for( var command in linkCommands.delegates ){
 			chainFunction[ command ] = linkCommands.delegates[ command ];
 		}
+
+		//The supplied parameter is the last config for the last procedure.
+		chainFunction.run = function( config ){
+			if( linkCommands.procedures.length - 1 == linkCommands.configs.length ){
+				//This is probably the last configuration.
+				( linkCommands.configs || linkCommands.configs = [ ] ).push( config );	
+			}
+
+			if( linkCommands.procedures.length != linkCommands.configs.length ){
+				//We have a big problem here.
+				throw new Error( "procedure and configuration mismatched" );
+			}
+
+			//Aggregate the procedures and configs
+			var operations = [];
+			for( var index in linkCommands.procedures ){
+				operations.push( {
+					procedure: linkCommands.procedures[ index ],
+					config: linkCommands.configs[ index ]
+				} );
+			}
+
+			//This is I think necessary.
+			//Procedures and configs should be volatile.
+			delete linkCommands.procedures;
+			delete linkCommands.configs;
+
+			//This will be a complex composite function.
+			var composite;
+			var config;
+			var procedure;
+
+			var constructCompositiveFunction = function( config, procedure ){
+				return ( function( result, callback ){
+					//Save the result in the link commands
+					linkCommands.lastResult = result;
+
+					//Override the callback with this intelligent one :)
+					config.callback = function( ){
+
+						//Convert first the argument into an array.
+						var parameters = Array.prototype.slice.call( arguments );
+
+						/*
+							The original callback will actually call the specified callback
+								in the configuration corresponding to the procedure.
+						*/
+						var callOriginalCallback = function( ){
+							//Take into account if we have original callbacks.
+							//Override it but still execute it.
+							if( config.callback ){
+								config.callback.apply( linkCommands, parameters );
+							}
+						};
+
+						//Search the argument if there is an Error parameter.
+						//This is the safest way to do it.
+						for( var _index in parameters ){
+							if( parameters[ _index ] instanceOf Error ){
+								callOriginalCallback( );
+								callback( parameters[ _index ] );
+								return;
+							}
+						}
+
+						//If none then add a null to the first index
+						parameter = parameter.slice( 0, null );
+						
+						callOriginalCallback( );
+						callback.apply( linkCommands, parameter );
+					}
+
+					//Main execution here.
+					procedure( config );
+				} );
+			}
+
+			var nextFunction;
+			var baseFunction = constructCompositiveFunction( operations[ 0 ].config,
+				operations[ 0 ].procedure );
+			for( var index = 1; index < operations.length; ){
+				nextFunction = constructCompositiveFunction( operations[ index ].config,
+					operations[ index ].procedure );
+				composite = _.async.compose( nextFunction, composite || baseFunction );
+			}
+
+			//We are now ready to execute the complex composite function.
+			composite
+		};
 
 		return chainFunction;
 	}catch( error ){
@@ -103,6 +238,9 @@ function listProcedures( procedure ){
 
 */
 function loadDb( host, port, callback ){
+
+	var linkCommands = constructLinkCommands( this );
+
 	try{
 		var constructMongoDbCommand = function( path, host, port ){
 			return ( function( config ){
@@ -544,6 +682,11 @@ exports.loadDb = loadDb;
 	Construct a dynamic bind link to the app for easy access of link commands.
 */
 function link( appID ){
+
+	//Create a link commands
+
+	var linkCommands = constructLinkCommands( this );
+
 	try{
 		return ( function( config ){
 			config = config || { };
