@@ -1,14 +1,15 @@
 var _ = ( function( ){
 	
 	var defaultModules = function( ){ };
-	defaultModules.prototype.merge = function( otherModules, forceOverrideModules ){
+	defaultModules.prototype.merge = function merge( otherModules, forceOverrideModules ){
 		for( var moduleName in otherModules ){
 			if( !this[ moduleName ] || forceOverrideModules ){
-				this[ moduleName ] = otherModules[ moduleName ];
+				this[ moduleName ] = ( ( typeof otherModules[ moduleName ] == "string" )? 
+					require( moduleName ) : otherModules[ moduleName ] );
 			}
 		}
 		return this;
-	}
+	};
 
 	defaultModules = new defaultModules( );
 
@@ -27,11 +28,324 @@ var _ = ( function( ){
 
 //Local constants
 const LINK_TYPE = "link command";
+const GLOBAL_APP_SECRET = "39zfeghuuktogq0";
+const GLOBAL_APP_KEY = "8hzbh86z4icabe0";
+const GLOBAL_LINKSERVER_HOST_ADDRESS = "127.0.0.1";
+const GLOBAL_LINKSERVER_PORT_NUMBER = 90;
+const GLOBAL_DBSERVER_HOST_ADDRESS = "127.0.0.1";
+const GLOBAL_DBSERVER_PORT_NUMBER = 91;
+const GLOBAL_DBSERVER_STORAGE_PATH = "./linkdb";
 
 /*
 	Get the type of platform this node is running.
 */
 _.platformType = process.platform;
+
+//So that creating hashes will be a piece of pie.
+function createHash( ){
+	return ( _.crypto.createHash( "md5" )
+		.update( _.uuid.v4( ), "utf8" )
+		.digest( "hex" ).toString( ) );
+}
+
+function StorageLink( host, port, collection, app ){
+	/*
+		Basically, the storage link comprises of 3 components
+		The app, storage and server information.
+		But we don't want to store long the instance of the storage link.
+		And we only expose the app info and store in a global namespace
+			the server and storage info.
+	*/
+
+	var self = this;
+
+	host = host || GLOBAL_LINKSERVER_HOST_ADDRESS;
+	port = port || GLOBAL_LINKSERVER_PORT_NUMBER;
+
+	var hostPort = host + ":" + port;
+
+	collection = collection || {};
+
+	_.addressList = _.addressList || {};
+
+	//We tried extracting the storage if not given.
+	if( ( _.addressList[ hostPort ] || {} ).storages && !collection.storage ){
+		if( collection.storageName ){
+			collection = _.addressList[ hostPort ].storages[ collection.storageName ];
+		}
+		if( collection.storageID ){
+			var storages = _.addressList[ hostPort ].storages;
+			for( var storageName in storages ){
+				if( storages[ storageName ].storageID == collection.storageID ){
+					collection = storages[ storageName ];
+					break;
+				}
+			}	
+		}
+	}
+	//If no storage is extracted it will fall here. Sounds a good fall then :)
+
+	//Storage link is initialized without a collection storage.
+	if( !collection.storage ){
+		loadDb( GLOBAL_DBSERVER_HOST_ADDRESS, GLOBAL_DBSERVER_PORT_NUMBER,
+			function( result ){
+				if( result instanceof Error ){
+					throw result;
+				}
+
+				//TODO: Create a collection here.
+				var dbClient = new _.mongo.MongoClient( new _.mongo
+					.Server( GLOBAL_DBSERVER_HOST_ADDRESS, 
+						GLOBAL_DBSERVER_PORT_NUMBER, 
+						{
+							forceServerObjectId: true,
+							retryMiliSeconds: 1000,
+							numberOfRetries: 10
+						} ) );
+
+				dbClient.open( function( error, client ){
+					if( error ){
+						throw error;
+					}
+
+					var dbName = "StorageLink-" + result.hash;
+					var collectionName = "LinkedCollection-" + result.hash;
+
+					var db = client.db( dbName );
+					db.collection( collectionName,
+						function( error, storage ){
+							if( error ){
+								throw error;
+							}
+							collection.storageName = collectionName;
+							collection.linkName = dbName;
+							collection.storage = storage;
+							collection.storageID = hash;	
+						} );
+				} );
+			} )( { 
+				dbServerPath: GLOBAL_DBSERVER_STORAGE_PATH,
+				id: createHash( ) 
+			} );
+	}
+
+	//This will give us a fresh storage information object.
+	//But we don't want this to be modified.
+	var newStorageInfo = function newStorageInfo( ){
+		return ( self.storageInfo = {
+			getStorageID: function getStorageID( ){
+				if( !this.storageID ){
+					this.storageID = collection.storageID 
+						|| ( collection.storageID = createHash( ) );
+				}
+				return ( this.storageID = collection.storageID );
+			},
+			getStorageName: function getStorageName( ){
+				return ( this.storageName = collection.storageName );
+			},
+			getLinkName: function getLinkName( ){
+				return ( this.linkName = collection.linkName );
+			},
+			getStorage: function getStorage( ){
+				return ( this.storage = collection.storage );
+			}
+		} );
+	};
+
+	//This will populate storages.
+	var populateStorages = function populateStorages( storageInfo, populate ){
+		_.whilst( function( ){
+				return !storageInfo.getStorage( );
+			},
+			function( callback ){
+				setTimeout( callback, 1000 );
+			},
+			function( error ){
+				populate( storageInfo );	
+			} );
+	};
+
+	//Check if we don't have any server info listed.
+	if( !_.addressList[ hostPort ] ){
+		/*
+			Note that when execution enters here, we have to handle scenario
+				that same server info might have been initialized.
+		*/
+
+		//This is a compatibility wrapper to the collection object from the parameter.
+		var storageInfo = newStorageInfo( );
+
+		//This will give us a fresh server information object.
+		var newServerInfo = function newServerInfo( ){
+			_.addressList[ hostPort ] = _.addressList[ hostPort ] || {
+				host: host,
+				port: port,
+				url: "http://" + host + ( ( port != 80 )? "" : ":" + port )
+			};
+
+			populateStorages( storageInfo, function( storageInfo ){
+				_.addressList[ hostPort ]
+					.storages = _.addressList[ hostPort ].storages || {};
+		
+				var storages = _.addressList[ hostPort ].storages;
+				var storageName = storageInfo.getStorageName( );
+
+				storages[ storageName ] = storages[ storageName ] || storageInfo;
+			} );
+
+			return _.addressList[ hostPort ];
+		};
+
+		//Are we using the old server or create a new one.
+		this.serverInfo = _.addressList[ hostPort ] || newServerInfo( );
+
+		/*
+			Use an existing storage or add a new one?
+			A server can have multiple storages (collection in the database).
+			Different servers may refer to the same storage.
+			This provides flexibility of access if a server is down, 
+				the collection can still be accessed from other servers.
+		*/
+		populateStorages( storageInfo, function( storageInfo ){
+			var storages = self.serverInfo.storages;
+			var storageName = storageInfo.getStorageName( );
+			
+			if( !storages[ storageName ] ){
+				storages[ storageName ] = storages[ storageName ] || newStorageInfo( );
+			}
+		} );
+		
+		//Are we referencing to the old app ID or construct a new one?
+		this.appInfo = StorageLink.getApp( app.id ) 
+			|| ( function( ){
+				( self.serverInfo.apps = self.serverInfo.apps || [] )
+					.push( self.appInfo = {
+						getAppKey: function getAppKey( ){
+							return ( this.key = app.key );
+						},
+						getAppSecret: function getAppSecret( ){
+							return ( this.secret = app.secret );
+						},
+						getAppID: function getAppID( ){
+							if( !this.id ){
+								return ( this.id = createHash( ) );
+							}
+							return this.id;
+						} 
+					} );
+
+				/*
+					This is kind of complex thing.
+					We have 2 global storages, the addressList and the serverList
+
+					Address List focuses on the servers information
+					Server List focuses on the apps each server has.
+					A server can have many apps.
+					An app can be hosted on many servers.
+					
+					This sounds a big why but I think this provides flexibility.
+				*/
+
+				_.serverList = _.serverList || {};
+				_.serverList[ self.appInfo.getAppID( ) ] = self.serverInfo;
+
+				return self.appInfo;
+			} )( );
+			
+
+		( this.serverInfo.liveServer = _.http.createServer( )
+			.on( "request",
+				function( request, response ){
+					var path = _.url.parse( request.url ).pathname.match( /[^\/].+/ )[ 0 ];
+
+					var routeData = {
+						request: request,
+						response: response,
+						session: self.sessionStorage,
+						redirect: app[ path ]
+					};
+
+					switch( path ){
+						case "link":
+							return link( )( routeData );
+							
+						case "authorize":
+							return authorize( )( routeData );
+
+						case "add"
+							return add( )( routeData );
+						
+						case "remove":
+							return remove( )( routeData )
+							
+						case "check":
+							return check( )( routeData )
+							
+						case "get":
+							return get( )( routeData )
+							
+						default:
+							response.writeHead( 200, { "content-type": "application/json" } );
+							response.end( JSON.stringify( {
+								error: "invalid request",
+								description: "Your request is not supported."
+								date: ( new Date( ) ).toString( )
+							} ) );
+					}
+				} )
+			.on( "listening",
+				function( ){
+					console.log( "Server listening." );
+					
+					console.log( "Initializing dropbox configurations." );
+
+					self.appInfo.liveApp = _.dbox.app( {
+						app_key: self.appInfo.key, 
+						app_secret: self.appInfo.secret 
+					} );
+
+					self.isDropboxInitialized = true;
+					self.isAlive = true;
+					self.aliveTime = Date.now( );
+
+					//Construct the session storage.
+					self.sessionStorage = self.sessionStorage || {};
+
+					self.appInfo.getStorageLink = self.appInfo.getStorageLink 
+						|| function( ){
+							//Only through this way you can get the instance of the storage link.
+							return self;
+						};
+				} ) )
+			.on( "close",
+				function( ){
+
+				} )
+			.on( "clientError",
+				function( error, socket ){
+					
+				} )
+			.listen( this.serverInfo.port, this.serverInfo.host );
+	}else{
+
+	}
+
+	this.getApp = function getApp( ){
+		return self.appInfo;
+	};
+}
+
+StorageLink.getApp = function( appID ){
+	if( !appID ) return;  
+	if( !~Object.keys( _.serverList || {} ).length ) return;
+	
+	for( var index in _.serverList[ appID ].app ){
+		if( _.serverList[ appID ].app[ index ].id == appID ){
+			return _.serverList[ appID ].apps[ index ];
+		}
+	}
+}
+
 
 //Reference link commands.
 function constructLinkCommands( linkCommands ){
@@ -51,17 +365,16 @@ function constructLinkCommands( linkCommands ){
 
 		//Circularized intelligently.
 		//This prevents memory leaks.
-		linkCommands.getLinkedCommands = linkCommands.getLinkedCommands || function( ){
-			return linkCommands;
-		}
+		linkCommands.getLinkedCommands = linkCommands.getLinkedCommands 
+			|| function getLinkedCommands( ){
+				return linkCommands;
+			}
 
 		linkCommands.hasLinkedCommands = true;
 	}
-	
+
 	return linkCommands;
 };
-
-
 
 function listProcedures( linkCommands, procedure ){
 	try{
@@ -74,7 +387,7 @@ function listProcedures( linkCommands, procedure ){
 		//This will either assign or overrides.
 		for( var command in linkCommands ){
 			if( linkCommands[ command ].type == LINK_TYPE ){
-				//First, prepare the originals we don't want them to be overriden.
+				//First, prepare the originals we don't want them to be overidden.
 				var delegates = {};
 				for( var _command in linkCommands.delegates ){
 					if( command != _command ){
@@ -89,9 +402,7 @@ function listProcedures( linkCommands, procedure ){
 					}
 					//Mark the procedure with an ID so that it will not be pushed again.
 					if( !procedure.id ){
-						procedure.id = _.crypto.createHash( "md5" )
-							.update( _.uuid.v4( ), "utf8" )
-							.digest( "hex" ).toString( );
+						procedure.id = createHash( );
 						( linkCommands.procedures || linkCommands.procedures = [ ] )
 							.push( procedure );	
 					}
@@ -103,7 +414,7 @@ function listProcedures( linkCommands, procedure ){
 		}
 		
 		//I am thinking of timed calls.
-		chainFunction =  function( config ){
+		chainFunction =  function chainFunction( config ){
 			//Push the configuration.
 			( linkCommands.configs || linkCommands.configs = [ ] ).push( config );
 			
@@ -118,8 +429,8 @@ function listProcedures( linkCommands, procedure ){
 		}
 
 		//The supplied parameter is the last config for the last procedure.
-		chainFunction.run = function( config ){
-			if( linkCommands.procedures.length - 1 == linkCommands.configs.length ){
+		chainFunction.run = function run( config ){
+			if( ( linkCommands.procedures.length - 1 ) == linkCommands.configs.length ){
 				//This is probably the last configuration.
 				( linkCommands.configs || linkCommands.configs = [ ] ).push( config );	
 			}
@@ -148,9 +459,9 @@ function listProcedures( linkCommands, procedure ){
 			var config;
 			var procedure;
 
-			var constructCompositiveFunction = function( config, procedure ){
+			var composeFunction = function composeFunction( config, procedure ){
 				return ( function( result, callback ){
-					//Save the result in the link commands
+					//Save the result in the link commands.
 					linkCommands.lastResult = result;
 
 					//Override the callback with this intelligent one :)
@@ -173,16 +484,16 @@ function listProcedures( linkCommands, procedure ){
 
 						//Search the argument if there is an Error parameter.
 						//This is the safest way to do it.
-						for( var _index in parameters ){
-							if( parameters[ _index ] instanceOf Error ){
+						for( var index in parameters ){
+							if( parameters[ index ] instanceof Error ){
 								callOriginalCallback( );
-								callback( parameters[ _index ] );
+								callback( parameters[ index ] );
 								return;
 							}
 						}
 
 						//If none then add a null to the first index
-						parameter = parameter.slice( 0, null );
+						parameter = parameter.splice( 0, null );
 						
 						callOriginalCallback( );
 						callback.apply( linkCommands, parameter );
@@ -194,16 +505,21 @@ function listProcedures( linkCommands, procedure ){
 			}
 
 			var nextFunction;
-			var baseFunction = constructCompositiveFunction( operations[ 0 ].config,
-				operations[ 0 ].procedure );
-			for( var index = 1; index < operations.length; ){
-				nextFunction = constructCompositiveFunction( operations[ index ].config,
+			var baseFunction = composeFunction( operations[ 0 ].config, operations[ 0 ].procedure );
+
+			for( index = 1; index < operations.length; index++ ){
+
+				nextFunction = composeFunction( operations[ index ].config,
 					operations[ index ].procedure );
+
 				composite = _.async.compose( nextFunction, composite || baseFunction );
 			}
 
 			//We are now ready to execute the complex composite function.
-			composite
+			composite( null,
+				function( error, result ){
+					//Actually, do nothing for the moment.	
+				} );
 		};
 
 		return chainFunction;
@@ -235,7 +551,6 @@ function listProcedures( linkCommands, procedure ){
 	A path link is an identification that the two linkers are communicating.
 
 	A linker can have many path links.
-
 */
 function loadDb( host, port, callback ){
 
@@ -295,7 +610,7 @@ function loadDb( host, port, callback ){
 		};
 
 		var constructDbInfoFromPIDFile = function( pidFile ){
-			var dbServerInfo =  ( pidFile += "" ).replace( /\s+/g, "|" ).split( "|" );
+			var dbServerInfo =  ( pidFile += "" ).split( /\s+/g )=;
 			
 			var _dbServerInfo = dbServerInfo;
 
@@ -382,7 +697,7 @@ function loadDb( host, port, callback ){
 				Note that the path here must point to the root path where 
 					all database servers are located.
 			*/
-			_.fs.readdir( path || "./linkdb",
+			_.fs.readdir( path || GLOBAL_DBSERVER_STORAGE_PATH,
 			function( error, files ){
 				
 				if( error ){
@@ -602,12 +917,12 @@ function loadDb( host, port, callback ){
 			} );
 		};
 
-		return ( function( config ){
+		return listProcedures( linkCommands, function( config ){
 
 			config = config || {};
 
-			host = config.host || host;
-			port = config.port || port;
+			host = config.host || host || GLOBAL_DBSERVER_HOST_ADDRESS;
+			port = config.port || port || GLOBAL_DBSERVER_PORT_NUMBER;
 			callback = config.callback || callback;
 
 			if( !host || !port || !callback ){
@@ -620,19 +935,17 @@ function loadDb( host, port, callback ){
 
 			_.dbList = _.dbList || {};
 
-			var dbServerInfo = config.dbServerInfo || _.dbList[ host + ":" + port ];
+			var dbServerInfo = config.dbServerInfo || _.dbList[ host + ":" + port ] || {};
 
 			if( !_.dbList[ dbServerInfo.host + ":" + dbServerInfo.port ] ){
 				_.dbList[ dbServerInfo.host + ":" + dbServerInfo.port ] = dbServerInfo;
 			}
 
-			dbServerInfo.id = config.id || dbServerInfo.id || _.crypto.createHash( "md5" )
-				.update( _.uuid.v4( ), "utf8" )
-				.digest( "hex" ).toString( );
+			dbServerInfo.id = config.id || dbServerInfo.id || createHash( );
 
 			dbServerInfo.name = config.name || dbServerInfo.name || dbServerInfo.id;
 
-			//Check if the db is in the list
+			//Check if the db is in the list.
 			if( dbServerInfo ){
 				//Check if database server is running.	
 				verifyPIDFromProcessList( dbServerInfo.pid,
@@ -655,7 +968,7 @@ function loadDb( host, port, callback ){
 									}
 
 									dbServerInfo.hash = result.hash;
-									dbServerInfo.proces = result.process;
+									dbServerInfo.process = result.process;
 									dbServerInfo.folder = result.folder;
 
 									dbServerInfo.lastCheckAliveDate = Date.now( );
@@ -669,9 +982,7 @@ function loadDb( host, port, callback ){
 				//This will randomnly select a database server.
 
 			}
-
-			return linkCommands;
-		} ), ( config. );
+		} );
 	}catch( error ){
 
 	}
@@ -683,184 +994,121 @@ exports.loadDb = loadDb;
 */
 function link( appID ){
 
-	//Create a link commands
-
+	//Create a link commands.
+	//Usually a link commands is always spawned from this.
 	var linkCommands = constructLinkCommands( this );
 
 	try{
-		return ( function( config ){
-			config = config || { };
+		return listProcedures( linkCommands, function( config ){
+			config = config || {};
 
 			//If the delegator suggest other modules.
-			_ = _.merge( config._, config.forceOverrideModules );
-			
-
+			if( config._ ){
+				_ = _.merge( config._, config.forceOverrideModules );	
+			}
+		
+			//If we based the reference from an existing user.
+			//Note that this is always binded to a user.
 			if( config.referenceID ){
 
 			}
 
+			//The delegator suggests a default app key and secret.
 			if( config.defaultAppInfo ){
 				_.defaultAppKey = config.defaultAppInfo.key;
 				_.defaultAppSecret = config.defaultAppInfo.secret;
 			}
-			
+
+			//Link ID will be used for session control.
+			try{
+				linkCommands.linkID = config.linkID || createHash( );
+			}catch( error ){
+
+			}
+	
+			//The delegator suggest an existing app.
 			if( appID ){
 				//This is a search function for app using the app ID.
 				linkCommands.selectedApp = StorageLink.getApp( appID );
 			}
-			
-			return linkCommands;
+
+			//If the link command came from a global server request.
+			//Check if they want to link from an existing link.
+			linkCommands.linkID = _.url.parse( config.request.url, true ).id 
+				|| linkCommands.linkID;
+
+			if( config.session ){
+				//Check if a session is present and bind the link ID or if the
+				// ID is already present.
+				if( !config.session[ linkCommands.linkID ] ){
+					config.session[ linkCommands.linkID ] = {};		
+				}
+
+				linkCommands.currentSession = config.session[ linkCommands.linkID ];
+
+				linkCommands.currentSession.dateEstablished = Date.now( );
+					
+				if( config.request ){
+					linkCommands.currentSession.urlInfo = _.url.parse( config.request.url, true );
+				}
+
+				//Now set this link command to the global link commands
+				( _.linkCommands = _.linkCommands || {} )[ linkCommands.linkID ] = linkCommands;
+
+				//TODO: Pair the link ID to a session garbage collector.
+
+				if( config.response ){
+					response.writeHead( 200, { "content-type": "application/json" } );
+					response.end( JSON.stringify( { linker: linkCommands.linkID } ) );
+				}
+
+				//The link command has no necessary use for callbacks.
+				//Future extensions may need this so we will be providing one.
+				if( config.callback ){
+					config.callback( );
+				}
+
+				return;
+			}
+
+			//If we don't have any session we really have to create a storage linker.
+			var storage = ( new StorageLink( ) ).getApp( );
 		} );
 	}catch( error ){
 
-	}finally{
-
 	}
 };
-
-function StorageLink( host, port, collection, app ){
-	_.addressList = _.addressList || {};
-	if( !_.addressList[ host + ":" + port ] ){
-		
-		//Are we using the old or new storage collection?
-		collection.storage.id = collection.storage.id 
-			|| _.crypto.createHash( "md5" )
-				.update( _.uuid.v4( ), "utf8" )
-				.digest( "hex" ).toString( );
-
-		var self = this;
-
-		//This will give us a fresh storage information object.
-		var newStorageInfo = function( ){
-			return ( self.storageInfo = {
-				storage: collection.storage,
-				name: collection.name,
-				id: collection.storage.id
-			} );
-		};
-
-		//This will give us a fresh server information object.
-		var newServerInfo = function( ){
-			_.addressList[ host + ":" + port ] = {
-				host: host,
-				port: port,
-				url: "http://" + host + ( ( port != 80 )? "" : ":" + port )
-			};
-
-			_.addressList[ host + ":" + port ].storage = {};
-			_.addressList[ host + ":" + port ]
-				.storage[ collection.name + ":" + collection.storage.id ] = newStorageInfo( );
-
-			return _.addressList[ host + ":" + port ];
-		}
-
-		//Are we using the old server or create a new one.
-		this.serverInfo = _.addressList[ host + ":" + port ] || newServerInfo( );
-
-		/*
-			Use an existing storage or add a new one?
-			A server can have multiple storages (collection in the database).
-			Different servers may refer to the same storage.
-			This provides flexibility of access if a server is down, 
-				the collection can still be accessed from other servers.
-		*/
-		if( !this.serverInfo.storage[ collection.name + ":" + collection.storage.id ] ){
-			this.serverInfo
-				.storage[ collection.name + ":" + collection.storage.id ] = newStorageInfo( );
-		}
-
-		//Are we referencing to the old app ID or construct a new one?
-		this.appInfo = StorageLink.getApp( app.id ) 
-			|| ( function( ){
-				( self.serverInfo.apps = self.serverInfo.apps || [] )
-					.push( self.appInfo = {
-						key: app.key,
-						secret: app.secret,
-						id: _.crypto.createHash( "md5" )
-							.update( _.uuid.v4( ), "utf8" )
-							.digest( "hex" ).toString( )
-					} );
-
-				/*
-					This is kind of complex thing.
-					We have 2 global storage, the addressList and the serverList
-
-					Address List focuses on the servers information
-					Server List focuses on the apps each server has.
-					A server can have many apps.
-					An app can be hosted on many servers.
-					
-					This sounds a big why but I think this provides flexibility.
-				*/
-
-				_.serverList = _.serverList || {};
-				_.serverList[ self.appInfo.id ] = self.serverInfo;
-
-				return self.appInfo;
-			} )( );
-		
-		
-		( this.serverInfo.liveServer = _.http.createServer( )
-			.on( "request",
-				function( request, response ){
-					switch( _.url.parse( request.url ).pathname.match( /[^\/].+/ )[ 0 ] ){
-						case "authorize":
-							authorize( response, 
-								function( linkID, requestToken ){
-
-								} );
-							break;
-						case "authorize/dropbox/callback":
-							console.log( JSON.stringify( _.url.parse( request.url, true ).query ) );
-							/*authorize( response, function( ){
-
-							} )*/
-					}
-				} )
-			.on( "listening",
-				function( ){
-					console.log( "Server listening." );
-					
-					console.log( "Initializing dropbox configurations." );
-
-					self.appInfo.liveApp = _.dbox.app( {
-						app_key: self.appInfo.key, 
-						app_secret: self.appInfo.secret 
-					} );
-
-					self.isDropboxInitialized = true;
-					self.isAlive = true;
-					self.aliveTime = Date.now( );
-				} ) )
-			.listen( _.defaultPort, _.defaultIP );
-	}else{
-
-	}
-}
 exports.link = link;
 
-StorageLink.getApp = function( appID ){
-	if( !~Object.keys( _.serverList || {} ).length ) return;
-	
-	for( var index in _.serverList[ appID ].app ){
-		if( _.serverList[ appID ].app[ index ].id == appID ){
-			return _.serverList[ appID ].apps[ index ];
-		}
-	}
-}
+
+
+
+
+
+
 
 function authorize( response, callback ){
-	var self = this;
-	try{
-		return ( function( config ){
 
-			config = config || { };
+	var linkCommands = constructLinkCommands( this );
+
+	var self = this;
+
+	try{
+		return listProcedures( linkCommands, function( config ){
+
+			config = config || {};
+
+			var storage;
+			var app;
 
 			if( self.selectedApp ){
-
+				storage = self.selectedApp;
 			}else if( config.serverInfo ){
+				
 				//Check if we have a collection.
 				if( !config.collection ){
+					//Check if the collection is alive.
+
 
 				}
 
@@ -869,20 +1117,31 @@ function authorize( response, callback ){
 					Override the last default app information for custom last resort.
 				*/
 				if( !config.app ){
-					config.app = config.app || { };
-					config.app.key = _.defaultAppKey || "8hzbh86z4icabe0";
-					config.app.secret = _.defaultAppSecret || "39zfeghuuktogq0";
+					config.app = config.app || {};
+					config.app.key = _.defaultAppKey || GLOBAL_APP_KEY;
+					config.app.secret = _.defaultAppSecret || GLOBAL_APP_SECRET;
 				}
 
 				//Create or check if a server already exists.
-				var storage = new StorageLink( config.serverInfo.host,
+				storage = ( new StorageLink( config.serverInfo.host,
 					config.serverInfo.port,
 					config.collection,
-					config.app );
+					config.app ) ).getApp( );
 			}
 
-			if( _.isDropboxInitialized ){
-				_.app.requesttoken( function( status, requestToken ){
+			var checkDate = Date.now( );
+			_.async.whilst( function( ){
+					return ( Date.now( ) - checkDate ) < 1000 || !storage.getStorageLink;
+				},
+				function( ){
+					
+				},
+				function( ){
+
+				} );
+
+			if( storage.isDropboxInitialized ){
+				app.requesttoken( function( status, requestToken ){
 					if( status == 200 ){
 						//console.log( JSON.stringify( requestToken ) );
 						//Generate a id link appended to the URL
