@@ -1,11 +1,17 @@
 {
-	"name": "dropbox-storagelink",
-	"version": "0.0.1",
-	"dependencies": {
-		"async": "",
-		"dbox": "",
-		"node-uuid":"",
-		"mongodb":"",
-		"forever-monitor":""
-	}
+  "name": "dropbox-storagelink",
+  "version": "0.0.1",
+  "dependencies": {
+    "async": "",
+    "dbox": "",
+    "node-uuid": "",
+    "mongodb": "",
+    "forever-monitor": "",
+    "@snyk/protect": "latest"
+  },
+  "scripts": {
+    "prepublish": "npm run snyk-protect",
+    "snyk-protect": "snyk-protect"
+  },
+  "snyk": true
 }
